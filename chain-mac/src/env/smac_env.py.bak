@@ -1,0 +1,126 @@
+"""SMAC (StarCraft Multi-Agent Challenge) environment adapter.
+
+Wraps the SMAC environment to match the interface expected by CHAIN-MAC:
+    reset()  →  state: np.ndarray [n_agents, obs_dim]
+    step(actions)  →  (next_state, reward, done)
+
+Also exposes global_state for QMIX mixing.
+"""
+
+import numpy as np
+from typing import Tuple, Optional
+
+
+class SMACEnv:
+    """Adapter from SMAC (oxwhirl) to CHAIN-MAC interface.
+
+    Usage:
+        env = SMACEnv(map_name="3m", seed=42)
+        obs = env.reset()                # [n_agents, obs_dim]
+        next_obs, reward, done = env.step(actions)  # actions: [n_agents] ints
+        global_state = env.get_global_state()        # [state_dim] for QMIX
+    """
+
+    def __init__(self, map_name: str = "3m", seed: Optional[int] = None,
+                 difficulty: str = "7", **kwargs):
+        self.map_name = map_name
+
+        # Late import so smac dependency is optional
+        from smac.env import StarCraft2Env
+        self._env = StarCraft2Env(
+            map_name=map_name,
+            difficulty=difficulty,
+            seed=seed,
+            **kwargs,
+        )
+
+        # Auto-detected on first reset()
+        self._obs_dim: Optional[int] = None
+        self._state_dim: Optional[int] = None
+
+        # Synced attributes
+        self.n_agents = self._env.n_agents
+        self.n_actions = self._env.n_actions
+
+        # Episode tracking
+        self.step_count = 0
+        self.episode_limit = self._env.episode_limit
+
+    # ── CHAIN-MAC interface ─────────────────────────────────────────────
+
+    def reset(self) -> np.ndarray:
+        self.step_count = 0
+        obs_list = self._env.reset()          # list of [obs_dim] arrays
+
+        obs = np.stack(obs_list, axis=0)      # [n_agents, obs_dim]
+
+        if self._obs_dim is None:
+            self._obs_dim = obs.shape[-1]
+        if self._state_dim is None:
+            self._state_dim = self._env.get_state().shape[-1]
+
+        return obs
+
+    def step(self, actions: np.ndarray) -> Tuple[np.ndarray, float, bool]:
+        """Take a step.
+
+        Args:
+            actions: [n_agents] ints in {0 .. n_actions-1}
+        Returns:
+            next_obs: [n_agents, obs_dim]
+            reward:   scalar float (shared team reward)
+            done:     bool
+        """
+        self.step_count += 1
+        actions_list = actions.tolist()
+
+        next_obs_list, rewards_list, dones_list, infos = self._env.step(actions_list)
+
+        next_obs = np.stack(next_obs_list, axis=0)   # [n_agents, obs_dim]
+        reward = float(np.mean(rewards_list))          # shared reward
+        done = all(dones_list) or self.step_count >= self.episode_limit
+
+        return next_obs, reward, done
+
+    # ── SMAC-specific helpers ───────────────────────────────────────────
+
+    def get_global_state(self) -> np.ndarray:
+        """Global state for QMIX mixing network."""
+        return self._env.get_state().astype(np.float32)
+
+    def get_avail_actions(self) -> np.ndarray:
+        """Available actions mask [n_agents, n_actions]."""
+        avail = self._env.get_avail_actions()
+        return np.stack(avail, axis=0)
+
+    # ── forwards to inner env ───────────────────────────────────────────
+
+    @property
+    def obs_dim(self) -> int:
+        assert self._obs_dim is not None, "Call reset() first to detect dims"
+        return self._obs_dim
+
+    @property
+    def state_dim(self) -> int:
+        assert self._state_dim is not None, "Call reset() first to detect dims"
+        return self._state_dim
+
+    def close(self):
+        self._env.close()
+
+    def render(self, mode="human"):
+        self._env.render(mode)
+
+
+# ── Scenario presets ──────────────────────────────────────────────────
+# Common SMAC scenarios and their (agents, obs_dim, action_dim, state_dim)
+# Auto-detected at runtime, listed here for quick reference.
+
+SCENARIO_INFO = {
+    "3m":       dict(n_agents=3,  action_dim=9),   # obs_dim ~192, state_dim ~288
+    "8m":       dict(n_agents=8,  action_dim=10),
+    "2s3z":     dict(n_agents=5,  action_dim=11),
+    "3s_vs_5z": dict(n_agents=3,  action_dim=10),
+    "5m_vs_6m": dict(n_agents=5,  action_dim=11),
+    "MMM2":     dict(n_agents=10, action_dim=13),
+}
